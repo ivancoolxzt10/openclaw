@@ -1,22 +1,49 @@
-import crypto from "node:crypto";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { isDeepStrictEqual } from "node:util";
-import JSON5 from "json5";
-import { ensureOwnerDisplaySecret } from "../agents/owner-display.js";
-import { loadDotEnv } from "../infra/dotenv.js";
-import { resolveRequiredHomeDir } from "../infra/home-dir.js";
+/**
+ * @fileoverview
+ *
+ * 这个文件是 OpenClaw 配置管理的 I/O 核心。它负责所有与配置文件（通常是 `openclaw.json`）
+ * 的物理读写操作，并封装了相关的复杂逻辑。主要功能包括：
+ *
+ * 1.  **读取配置**: 从磁盘加载 `openclaw.json` 文件。
+ * 2.  **解析与扩展**:
+ *     - 使用 `json5` 解析文件，支持更灵活的 JSON 格式（如注释、尾随逗号）。
+ *     - 处理 `$include` 指令，将多个配置文件合并在一起。
+ *     - 解析和替换 `${VAR}` 形式的环境变量。
+ * 3.  **验证与规范化**:
+ *     - 使用 Zod schema 验证配置对象的结构是否正确。
+ *     - 对加载的配置应用各种默认值和规范化规则（如路径、模型、日志等）。
+ *     - 检测并报告遗留（legacy）的配置项。
+ * 4.  **写入配置**: 将内存中的配置对象写回磁盘。
+ *     - 在写入前，会智能地恢复之前被解析的环境变量引用（`${VAR}`），避免将敏感值硬编码到文件中。
+ *     - 自动处理文件备份和轮换 (`.bak`)。
+ *     - 记录配置写入审计日志 (`config-audit.jsonl`)，用于追踪变更历史。
+ * 5.  **缓存与快照**:
+ *     - 提供内存缓存机制，减少频繁的文件读写，提升性能。
+ *     - 管理“运行时快照”，支持配置的热重载（live reload）和跨模块的配置一致性。
+ *
+ * `createConfigIO` 是本文件的核心工厂函数，它返回一个包含 `loadConfig`、`readConfigFileSnapshot`、
+ * 和 `writeConfigFile` 等主要操作方法的对象，为上层应用提供了一个清晰、安全的配置交互接口。
+ */
+
+import crypto from "node:crypto"; // 导入 Node.js 的加密模块，主要用于计算文件内容的哈希值。
+import fs from "node:fs"; // 导入文件系统模块，用于读写文件。
+import os from "node:os"; // 导入操作系统模块，用于获取用户主目录等信息。
+import path from "node:path"; // 导入路径处理模块，用于操作和解析文件路径。
+import { isDeepStrictEqual } from "node:util"; // 导入工具模块的深度严格相等比较函数。
+import JSON5 from "json5"; // 导入 JSON5 库，用于解析带注释和尾随逗号的 JSON 文件。
+import { ensureOwnerDisplaySecret } from "../agents/owner-display.js"; // 导入确保所有者显示密钥存在的函数。
+import { loadDotEnv } from "../infra/dotenv.js"; // 导入加载 `.env` 文件的函数。
+import { resolveRequiredHomeDir } from "../infra/home-dir.js"; // 导入解析用户主目录的函数。
 import {
   loadShellEnvFallback,
   resolveShellEnvFallbackTimeoutMs,
   shouldDeferShellEnvFallback,
   shouldEnableShellEnvFallback,
-} from "../infra/shell-env.js";
-import { sanitizeTerminalText } from "../terminal/safe-text.js";
-import { VERSION } from "../version.js";
-import { DuplicateAgentDirError, findDuplicateAgentDirs } from "./agent-dirs.js";
-import { maintainConfigBackups } from "./backup-rotation.js";
+} from "../infra/shell-env.js"; // 导入与 shell 环境加载相关的函数。
+import { sanitizeTerminalText } from "../terminal/safe-text.js"; // 导入用于清理终端文本中不安全字符的函数。
+import { VERSION } from "../version.js"; // 导入当前应用的版本号。
+import { DuplicateAgentDirError, findDuplicateAgentDirs } from "./agent-dirs.js"; // 导入检查重复 agent 目录的函数和错误类型。
+import { maintainConfigBackups } from "./backup-rotation.js"; // 导入维护配置文件备份的函数。
 import {
   applyCompactionDefaults,
   applyContextPruningDefaults,
@@ -27,38 +54,39 @@ import {
   applySessionDefaults,
   applyTalkConfigNormalization,
   applyTalkApiKey,
-} from "./defaults.js";
-import { restoreEnvVarRefs } from "./env-preserve.js";
+} from "./defaults.js"; // 导入一系列用于应用默认配置的函数。
+import { restoreEnvVarRefs } from "./env-preserve.js"; // 导入用于恢复环境变量引用的函数。
 import {
   type EnvSubstitutionWarning,
   MissingEnvVarError,
   containsEnvVarReference,
   resolveConfigEnvVars,
-} from "./env-substitution.js";
-import { applyConfigEnvVars } from "./env-vars.js";
+} from "./env-substitution.js"; // 导入环境变量替换相关的工具和类型。
+import { applyConfigEnvVars } from "./env-vars.js"; // 导入应用配置中定义的环境变量的函数。
 import {
   ConfigIncludeError,
   readConfigIncludeFileWithGuards,
   resolveConfigIncludes,
-} from "./includes.js";
-import { findLegacyConfigIssues } from "./legacy.js";
-import { applyMergePatch } from "./merge-patch.js";
-import { normalizeExecSafeBinProfilesInConfig } from "./normalize-exec-safe-bin.js";
-import { normalizeConfigPaths } from "./normalize-paths.js";
-import { resolveConfigPath, resolveDefaultConfigCandidates, resolveStateDir } from "./paths.js";
-import { isBlockedObjectKey } from "./prototype-keys.js";
-import { applyConfigOverrides } from "./runtime-overrides.js";
-import type { OpenClawConfig, ConfigFileSnapshot, LegacyConfigIssue } from "./types.js";
+} from "./includes.js"; // 导入处理 `$include` 指令的函数和错误类型。
+import { findLegacyConfigIssues } from "./legacy.js"; // 导入查找遗留配置问题的函数。
+import { applyMergePatch } from "./merge-patch.js"; // 导入应用合并补丁的函数。
+import { normalizeExecSafeBinProfilesInConfig } from "./normalize-exec-safe-bin.js"; // 导入规范化安全执行配置的函数。
+import { normalizeConfigPaths } from "./normalize-paths.js"; // 导入规范化路径配置的函数。
+import { resolveConfigPath, resolveDefaultConfigCandidates, resolveStateDir } from "./paths.js"; // 导入解析各种配置路径的函数。
+import { isBlockedObjectKey } from "./prototype-keys.js"; // 导入检查是否为被阻止的原型键的函数。
+import { applyConfigOverrides } from "./runtime-overrides.js"; // 导入应用运行时覆盖配置的函数。
+import type { OpenClawConfig, ConfigFileSnapshot, LegacyConfigIssue } from "./types.js"; // 导入配置相关的 TypeScript 类型。
 import {
   validateConfigObjectRawWithPlugins,
   validateConfigObjectWithPlugins,
-} from "./validation.js";
-import { compareOpenClawVersions } from "./version.js";
+} from "./validation.js"; // 导入配置验证函数。
+import { compareOpenClawVersions } from "./version.js"; // 导入版本比较函数。
 
-// Re-export for backwards compatibility
+// 重新导出类型以保持向后兼容性。
 export { CircularIncludeError, ConfigIncludeError } from "./includes.js";
 export { MissingEnvVarError } from "./env-substitution.js";
 
+// 在加载 shell 环境时，期望检查是否存在的一些关键环境变量。
 const SHELL_ENV_EXPECTED_KEYS = [
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
@@ -80,76 +108,87 @@ const SHELL_ENV_EXPECTED_KEYS = [
   "OPENCLAW_GATEWAY_PASSWORD",
 ];
 
+// 用于匹配开放 DM（直接消息）策略配置错误的正则表达式。
 const OPEN_DM_POLICY_ALLOW_FROM_RE =
   /^(?<policyPath>[a-z0-9_.-]+)\s*=\s*"open"\s+requires\s+(?<allowPath>[a-z0-9_.-]+)(?:\s+\(or\s+[a-z0-9_.-]+\))?\s+to include "\*"$/i;
 
+// 配置审计日志的文件名。
 const CONFIG_AUDIT_LOG_FILENAME = "config-audit.jsonl";
+// 用于跟踪已记录的无效配置，避免重复打印错误。
 const loggedInvalidConfigs = new Set<string>();
 
+// 配置写入审计结果的类型。
 type ConfigWriteAuditResult = "rename" | "copy-fallback" | "failed";
 
+// 配置写入审计记录的结构。
 type ConfigWriteAuditRecord = {
-  ts: string;
-  source: "config-io";
-  event: "config.write";
-  result: ConfigWriteAuditResult;
-  configPath: string;
-  pid: number;
-  ppid: number;
-  cwd: string;
-  argv: string[];
-  execArgv: string[];
-  watchMode: boolean;
-  watchSession: string | null;
-  watchCommand: string | null;
-  existsBefore: boolean;
-  previousHash: string | null;
-  nextHash: string | null;
-  previousBytes: number | null;
-  nextBytes: number | null;
-  changedPathCount: number | null;
-  hasMetaBefore: boolean;
-  hasMetaAfter: boolean;
-  gatewayModeBefore: string | null;
-  gatewayModeAfter: string | null;
-  suspicious: string[];
-  errorCode?: string;
-  errorMessage?: string;
+  ts: string; // 时间戳
+  source: "config-io"; // 来源
+  event: "config.write"; // 事件类型
+  result: ConfigWriteAuditResult; // 写入结果
+  configPath: string; // 配置文件路径
+  pid: number; // 进程 ID
+  ppid: number; // 父进程 ID
+  cwd: string; // 当前工作目录
+  argv: string[]; // 命令行参数
+  execArgv: string[]; // Node.js 执行参数
+  watchMode: boolean; // 是否处于观察模式
+  watchSession: string | null; // 观察会话 ID
+  watchCommand: string | null; // 观察模式下的命令
+  existsBefore: boolean; // 写入前文件是否存在
+  previousHash: string | null; // 之前的文件哈希
+  nextHash: string | null; // 新文件的哈希
+  previousBytes: number | null; // 之前的文件大小
+  nextBytes: number | null; // 新文件的大小
+  changedPathCount: number | null; // 变化的路径数量
+  hasMetaBefore: boolean; // 写入前是否有 meta 字段
+  hasMetaAfter: boolean; // 写入后是否有 meta 字段
+  gatewayModeBefore: string | null; // 之前的网关模式
+  gatewayModeAfter: string | null; // 之后的网关模式
+  suspicious: string[]; // 可疑变更的原因列表
+  errorCode?: string; // 错误码
+  errorMessage?: string; // 错误信息
 };
 
+// 解析 JSON5 字符串的结果类型。
 export type ParseConfigJson5Result = { ok: true; parsed: unknown } | { ok: false; error: string };
+// 配置文件写入的选项。
 export type ConfigWriteOptions = {
   /**
-   * Read-time env snapshot used to validate `${VAR}` restoration decisions.
-   * If omitted, write falls back to current process env.
+   * 读取时捕获的环境变量快照，用于在写入时验证 `${VAR}` 的恢复决策。
+   * 如果省略，写入操作将回退到当前的进程环境变量。
    */
   envSnapshotForRestore?: Record<string, string | undefined>;
   /**
-   * Optional safety check: only use envSnapshotForRestore when writing the
-   * same config file path that produced the snapshot.
+   * 可选的安全检查：仅当写入的配置文件路径与生成快照的路径相同时，
+   * 才使用 envSnapshotForRestore。
    */
   expectedConfigPath?: string;
   /**
-   * Paths that must be explicitly removed from the persisted file payload,
-   * even if schema/default normalization reintroduces them.
+   * 必须从持久化文件内容中明确移除的路径列表，
+   * 即使 schema/默认值规范化会重新引入它们。
    */
   unsetPaths?: string[][];
 };
 
+// 为写入操作读取配置文件快照的结果类型。
 export type ReadConfigFileSnapshotForWriteResult = {
   snapshot: ConfigFileSnapshot;
   writeOptions: ConfigWriteOptions;
 };
 
+// 运行时配置快照刷新的参数类型。
 export type RuntimeConfigSnapshotRefreshParams = {
   sourceConfig: OpenClawConfig;
 };
 
+// 运行时配置快照刷新的处理器类型。
 export type RuntimeConfigSnapshotRefreshHandler = {
   refresh: (params: RuntimeConfigSnapshotRefreshParams) => boolean | Promise<boolean>;
   clearOnRefreshFailure?: () => void;
 };
 
+// 配置运行时刷新错误的自定义错误类。
 export class ConfigRuntimeRefreshError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -157,6 +196,11 @@ export class ConfigRuntimeRefreshError extends Error {
   }
 }
 
+/**
+ * 计算原始配置字符串的 SHA256 哈希值。
+ * @param raw 原始配置字符串，如果为 null，则视为空字符串。
+ * @returns 64个字符的十六进制哈希字符串。
+ */
 function hashConfigRaw(raw: string | null): string {
   return crypto
     .createHash("sha256")
@@ -164,40 +208,57 @@ function hashConfigRaw(raw: string | null): string {
     .digest("hex");
 }
 
+/**
+ * 如果需要，收紧状态目录的权限（仅限非 Windows 系统）。
+ * 这是一个尽力而为的安全强化措施。
+ * @param params 包含配置路径、环境、homedir 函数和 fs 模块的对象。
+ */
 async function tightenStateDirPermissionsIfNeeded(params: {
   configPath: string;
   env: NodeJS.ProcessEnv;
   homedir: () => string;
   fsModule: typeof fs;
 }): Promise<void> {
+  // Windows 系统不支持 POSIX 权限，直接返回。
   if (process.platform === "win32") {
     return;
   }
   const stateDir = resolveStateDir(params.env, params.homedir);
   const configDir = path.dirname(params.configPath);
+  // 仅当配置文件在状态目录中时才操作。
   if (path.resolve(configDir) !== path.resolve(stateDir)) {
     return;
   }
   try {
     const stat = await params.fsModule.promises.stat(configDir);
-    const mode = stat.mode & 0o777;
+    const mode = stat.mode & 0o777; // 获取权限位
+    // 如果其他用户和组没有任何权限，则权限已足够严格。
     if ((mode & 0o077) === 0) {
       return;
     }
+    // 将目录权限设置为 700 (rwx------)。
     await params.fsModule.promises.chmod(configDir, 0o700);
   } catch {
-    // Best-effort hardening only; callers still need the config write to proceed.
+    // 这是一个尽力而为的操作，即使失败，也应继续执行配置写入。
   }
 }
 
+/**
+ * 格式化配置验证失败时的错误消息，特别是为开放 DM 策略提供友好的修复建议。
+ * @param pathLabel 发生问题的配置路径标签。
+ * @param issueMessage 原始的错误信息。
+ * @returns 格式化后的、对用户更友好的错误消息。
+ */
 function formatConfigValidationFailure(pathLabel: string, issueMessage: string): string {
   const match = issueMessage.match(OPEN_DM_POLICY_ALLOW_FROM_RE);
   const policyPath = match?.groups?.policyPath?.trim();
   const allowPath = match?.groups?.allowPath?.trim();
+  // 如果不是特定的 DM 策略问题，则返回通用格式。
   if (!policyPath || !allowPath) {
     return `Config validation failed: ${pathLabel}: ${issueMessage}`;
   }
 
+  // 为 DM 策略问题提供具体的修复命令。
   return [
     `Config validation failed: ${pathLabel}`,
     "",
@@ -211,36 +272,64 @@ function formatConfigValidationFailure(pathLabel: string, issueMessage: string):
   ].join("\n");
 }
 
+/**
+ * 检查路径段是否为数字（用于数组索引）。
+ * @param raw 路径段字符串。
+ * @returns 如果字符串只包含数字，则返回 true。
+ */
 function isNumericPathSegment(raw: string): boolean {
   return /^[0-9]+$/.test(raw);
 }
 
+/**
+ * 检查一个值是否为可用于写入的普通对象。
+ * @param value 要检查的值。
+ * @returns 如果是普通对象，则返回 true。
+ */
 function isWritePlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * 检查对象是否自身拥有指定的键（而不是从原型链继承）。
+ * @param value 对象。
+ * @param key 键名。
+ * @returns 如果对象自身拥有该键，则返回 true。
+ */
 function hasOwnObjectKey(value: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+// 一个特殊的 Symbol，用于标记一个对象在 unset 操作后应该被完全删除。
 const WRITE_PRUNED_OBJECT = Symbol("write-pruned-object");
 
+// 从值中移除指定路径的结果类型。
 type UnsetPathWriteResult = {
-  changed: boolean;
-  value: unknown;
+  changed: boolean; // 是否发生了改变
+  value: unknown; // 操作后的新值
 };
 
+/**
+ * 递归地从一个值中移除指定路径的属性。
+ * 这是 `unsetPathForWrite` 的核心实现。
+ * @param value 当前正在处理的值。
+ * @param pathSegments 要移除的路径分段数组。
+ * @param depth 当前递归的深度。
+ * @returns 返回一个包含是否更改和新值的对象。
+ */
 function unsetPathForWriteAt(
   value: unknown,
   pathSegments: string[],
   depth: number,
 ): UnsetPathWriteResult {
+  // 如果已经到达路径末端，则无需操作。
   if (depth >= pathSegments.length) {
     return { changed: false, value };
   }
   const segment = pathSegments[depth];
   const isLeaf = depth === pathSegments.length - 1;
 
+  // 处理数组
   if (Array.isArray(value)) {
     if (!isNumericPathSegment(segment)) {
       return { changed: false, value };
@@ -250,16 +339,19 @@ function unsetPathForWriteAt(
       return { changed: false, value };
     }
     if (isLeaf) {
+      // 如果是叶子节点，直接移除该索引的元素。
       const next = value.slice();
       next.splice(index, 1);
       return { changed: true, value: next };
     }
+    // 递归处理子元素。
     const child = unsetPathForWriteAt(value[index], pathSegments, depth + 1);
     if (!child.changed) {
       return { changed: false, value };
     }
     const next = value.slice();
     if (child.value === WRITE_PRUNED_OBJECT) {
+      // 如果子对象被完全修剪，则从数组中移除。
       next.splice(index, 1);
     } else {
       next[index] = child.value;
@@ -267,6 +359,7 @@ function unsetPathForWriteAt(
     return { changed: true, value: next };
   }
 
+  // 处理对象
   if (
     isBlockedObjectKey(segment) ||
     !isWritePlainObject(value) ||
@@ -275,30 +368,41 @@ function unsetPathForWriteAt(
     return { changed: false, value };
   }
   if (isLeaf) {
+    // 如果是叶子节点，直接删除该键。
     const next: Record<string, unknown> = { ...value };
     delete next[segment];
     return {
       changed: true,
+      // 如果对象变空，则标记为待修剪。
       value: Object.keys(next).length === 0 ? WRITE_PRUNED_OBJECT : next,
     };
   }
 
+  // 递归处理子对象。
   const child = unsetPathForWriteAt(value[segment], pathSegments, depth + 1);
   if (!child.changed) {
     return { changed: false, value };
   }
   const next: Record<string, unknown> = { ...value };
   if (child.value === WRITE_PRUNED_OBJECT) {
+    // 如果子对象被完全修剪，则删除该键。
     delete next[segment];
   } else {
     next[segment] = child.value;
   }
   return {
     changed: true,
+    // 如果对象变空，则标记为待修剪。
     value: Object.keys(next).length === 0 ? WRITE_PRUNED_OBJECT : next,
   };
 }
 
+/**
+ * 从根配置对象中移除指定路径的属性。
+ * @param root 根配置对象。
+ * @param pathSegments 要移除的路径分段数组。
+ * @returns 返回一个包含是否更改和新配置的对象。
+ */
 function unsetPathForWrite(
   root: OpenClawConfig,
   pathSegments: string[],
@@ -311,6 +415,7 @@ function unsetPathForWrite(
     return { changed: false, next: root };
   }
   if (result.value === WRITE_PRUNED_OBJECT) {
+    // 如果整个对象被修剪，返回一个空对象。
     return { changed: true, next: {} };
   }
   if (isWritePlainObject(result.value)) {
@@ -319,6 +424,12 @@ function unsetPathForWrite(
   return { changed: false, next: root };
 }
 
+/**
+ * 解析配置快照的哈希值。
+ * 优先使用 `hash` 字段，如果不存在，则根据 `raw` 内容计算。
+ * @param snapshot 包含 `hash` 或 `raw` 属性的快照对象。
+ * @returns 哈希字符串或 null。
+ */
 export function resolveConfigSnapshotHash(snapshot: {
   hash?: string;
   raw?: string | null;
@@ -335,6 +446,12 @@ export function resolveConfigSnapshotHash(snapshot: {
   return hashConfigRaw(snapshot.raw);
 }
 
+/**
+ * 将一个未知类型的值强制转换为 OpenClawConfig 类型。
+ * 如果值不是对象，则返回一个空对象。
+ * @param value 要转换的值。
+ * @returns OpenClawConfig 对象。
+ */
 function coerceConfig(value: unknown): OpenClawConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
@@ -342,10 +459,20 @@ function coerceConfig(value: unknown): OpenClawConfig {
   return value as OpenClawConfig;
 }
 
+/**
+ * 检查一个值是否为普通对象。
+ * @param value 要检查的值。
+ * @returns 如果是普通对象，则返回 true。
+ */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * 检查配置对象是否包含 `meta` 字段。
+ * @param value 配置对象。
+ * @returns 如果包含 `meta` 对象，则返回 true。
+ */
 function hasConfigMeta(value: unknown): boolean {
   if (!isPlainObject(value)) {
     return false;
@@ -354,6 +481,11 @@ function hasConfigMeta(value: unknown): boolean {
   return isPlainObject(meta);
 }
 
+/**
+ * 解析配置对象中的网关模式。
+ * @param value 配置对象。
+ * @returns 网关模式字符串或 null。
+ */
 function resolveGatewayMode(value: unknown): string | null {
   if (!isPlainObject(value)) {
     return null;
@@ -366,10 +498,21 @@ function resolveGatewayMode(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+/**
+ * 使用 `structuredClone` 克隆一个未知类型的值。
+ * @param value 要克隆的值。
+ * @returns 克隆后的值。
+ */
 function cloneUnknown<T>(value: T): T {
   return structuredClone(value);
 }
 
+/**
+ * 创建一个用于从 `base` 对象转换到 `target` 对象的合并补丁（merge patch）。
+ * @param base 基础对象。
+ * @param target 目标对象。
+ * @returns 表示变更的补丁对象。
+ */
 function createMergePatch(base: unknown, target: unknown): unknown {
   if (!isPlainObject(base) || !isPlainObject(target)) {
     return cloneUnknown(target);
@@ -381,16 +524,19 @@ function createMergePatch(base: unknown, target: unknown): unknown {
     const hasBase = key in base;
     const hasTarget = key in target;
     if (!hasTarget) {
+      // 如果目标中不存在，则标记为删除。
       patch[key] = null;
       continue;
     }
     const targetValue = target[key];
     if (!hasBase) {
+      // 如果基础中不存在，则为新增。
       patch[key] = cloneUnknown(targetValue);
       continue;
     }
     const baseValue = base[key];
     if (isPlainObject(baseValue) && isPlainObject(targetValue)) {
+      // 递归创建子补丁。
       const childPatch = createMergePatch(baseValue, targetValue);
       if (isPlainObject(childPatch) && Object.keys(childPatch).length === 0) {
         continue;
@@ -399,12 +545,19 @@ function createMergePatch(base: unknown, target: unknown): unknown {
       continue;
     }
     if (!isDeepStrictEqual(baseValue, targetValue)) {
+      // 如果值不相等，则为更新。
       patch[key] = cloneUnknown(targetValue);
     }
   }
   return patch;
 }
 
+/**
+ * 递归地收集对象中所有包含环境变量引用 (`${VAR}`) 的值的路径。
+ * @param value 当前值。
+ * @param path 当前路径。
+ * @param output 用于存储结果的 Map。
+ */
 function collectEnvRefPaths(value: unknown, path: string, output: Map<string, string>): void {
   if (typeof value === "string") {
     if (containsEnvVarReference(value)) {
@@ -426,6 +579,13 @@ function collectEnvRefPaths(value: unknown, path: string, output: Map<string, st
   }
 }
 
+/**
+ * 递归地收集两个对象之间发生变化的所有属性路径。
+ * @param base 基础对象。
+ * @param target 目标对象。
+ * @param path 当前路径。
+ * @param output 用于存储结果的 Set。
+ */
 function collectChangedPaths(
   base: unknown,
   target: unknown,
@@ -463,6 +623,11 @@ function collectChangedPaths(
   }
 }
 
+/**
+ * 获取一个路径的父路径。
+ * @param value 完整路径字符串。
+ * @returns 父路径字符串。
+ */
 function parentPath(value: string): string {
   if (!value) {
     return "";
@@ -475,6 +640,12 @@ function parentPath(value: string): string {
   return index >= 0 ? value.slice(0, index) : "";
 }
 
+/**
+ * 检查给定路径或其任何父路径是否在已更改路径集合中。
+ * @param path 要检查的路径。
+ * @param changedPaths 已更改路径的集合。
+ * @returns 如果路径已更改，则返回 true。
+ */
 function isPathChanged(path: string, changedPaths: Set<string>): boolean {
   if (changedPaths.has(path)) {
     return true;
@@ -489,6 +660,14 @@ function isPathChanged(path: string, changedPaths: Set<string>): boolean {
   return changedPaths.has("");
 }
 
+/**
+ * 递归地恢复对象中未被更改的环境变量引用。
+ * @param value 当前值。
+ * @param path 当前路径。
+ * @param envRefMap 原始环境变量引用映射。
+ * @param changedPaths 已更改路径的集合。
+ * @returns 恢复后的值。
+ */
 function restoreEnvRefsFromMap(
   value: unknown,
   path: string,
@@ -496,6 +675,7 @@ function restoreEnvRefsFromMap(
   changedPaths: Set<string>,
 ): unknown {
   if (typeof value === "string") {
+    // 如果当前路径未被更改，并且在原始引用映射中存在，则恢复它。
     if (!isPathChanged(path, changedPaths)) {
       const original = envRefMap.get(path);
       if (original !== undefined) {
@@ -531,10 +711,21 @@ function restoreEnvRefsFromMap(
   return value;
 }
 
+/**
+ * 解析配置审计日志文件的完整路径。
+ * @param env 进程环境变量。
+ * @param homedir 获取主目录的函数。
+ * @returns 审计日志文件的绝对路径。
+ */
 function resolveConfigAuditLogPath(env: NodeJS.ProcessEnv, homedir: () => string): string {
   return path.join(resolveStateDir(env, homedir), "logs", CONFIG_AUDIT_LOG_FILENAME);
 }
 
+/**
+ * 分析并返回配置写入中可能存在的可疑变更的原因。
+ * @param params 包含写入前后状态信息的对象。
+ * @returns 一个包含可疑原因描述字符串的数组。
+ */
 function resolveConfigWriteSuspiciousReasons(params: {
   existsBefore: boolean;
   previousBytes: number | null;
@@ -547,6 +738,7 @@ function resolveConfigWriteSuspiciousReasons(params: {
   if (!params.existsBefore) {
     return reasons;
   }
+  // 文件大小大幅减小
   if (
     typeof params.previousBytes === "number" &&
     typeof params.nextBytes === "number" &&
@@ -555,15 +747,22 @@ function resolveConfigWriteSuspiciousReasons(params: {
   ) {
     reasons.push(`size-drop:${params.previousBytes}->${params.nextBytes}`);
   }
+  // 写入前缺少 meta 字段
   if (!params.hasMetaBefore) {
     reasons.push("missing-meta-before-write");
   }
+  // 网关模式被移除
   if (params.gatewayModeBefore && !params.gatewayModeAfter) {
     reasons.push("gateway-mode-removed");
   }
   return reasons;
 }
 
+/**
+ * 将一条配置写入审计记录追加到日志文件中。
+ * @param deps 依赖项对象。
+ * @param record 要写入的审计记录。
+ */
 async function appendConfigWriteAuditRecord(
   deps: Required<ConfigIoDeps>,
   record: ConfigWriteAuditRecord,
@@ -576,19 +775,25 @@ async function appendConfigWriteAuditRecord(
       mode: 0o600,
     });
   } catch {
-    // best-effort
+    // 这是一个尽力而为的操作。
   }
 }
 
+// 定义配置 I/O 操作的依赖项类型。
 export type ConfigIoDeps = {
-  fs?: typeof fs;
-  json5?: typeof JSON5;
-  env?: NodeJS.ProcessEnv;
-  homedir?: () => string;
-  configPath?: string;
-  logger?: Pick<typeof console, "error" | "warn">;
+  fs?: typeof fs; // 文件系统模块
+  json5?: typeof JSON5; // JSON5 解析器
+  env?: NodeJS.ProcessEnv; // 进程环境变量
+  homedir?: () => string; // 获取主目录的函数
+  configPath?: string; // 配置文件路径
+  logger?: Pick<typeof console, "error" | "warn">; // 日志记录器
 };
 
+/**
+ * 检查配置中是否存在已废弃的键名并发出警告。
+ * @param raw 原始配置对象。
+ * @param logger 日志记录器。
+ */
 function warnOnConfigMiskeys(raw: unknown, logger: Pick<typeof console, "warn">): void {
   if (!raw || typeof raw !== "object") {
     return;
@@ -604,6 +809,11 @@ function warnOnConfigMiskeys(raw: unknown, logger: Pick<typeof console, "warn">)
   }
 }
 
+/**
+ * 为配置对象添加或更新版本和时间戳元数据。
+ * @param cfg 原始配置对象。
+ * @returns 带有更新后 meta 字段的配置对象。
+ */
 function stampConfigVersion(cfg: OpenClawConfig): OpenClawConfig {
   const now = new Date().toISOString();
   return {
@@ -616,6 +826,11 @@ function stampConfigVersion(cfg: OpenClawConfig): OpenClawConfig {
   };
 }
 
+/**
+ * 如果配置文件是由一个更新版本的 OpenClaw 写入的，则发出警告。
+ * @param cfg 配置对象。
+ * @param logger 日志记录器。
+ */
 function warnIfConfigFromFuture(cfg: OpenClawConfig, logger: Pick<typeof console, "warn">): void {
   const touched = cfg.meta?.lastTouchedVersion;
   if (!touched) {
@@ -632,6 +847,11 @@ function warnIfConfigFromFuture(cfg: OpenClawConfig, logger: Pick<typeof console
   }
 }
 
+/**
+ * 从依赖项中解析出最终的配置文件路径。
+ * @param deps 依赖项对象。
+ * @returns 配置文件路径。
+ */
 function resolveConfigPathForDeps(deps: Required<ConfigIoDeps>): string {
   if (deps.configPath) {
     return deps.configPath;
@@ -639,6 +859,11 @@ function resolveConfigPathForDeps(deps: Required<ConfigIoDeps>): string {
   return resolveConfigPath(deps.env, resolveStateDir(deps.env, deps.homedir));
 }
 
+/**
+ * 规范化依赖项对象，为所有可选字段提供默认值。
+ * @param overrides 用户提供的覆盖项。
+ * @returns 一个包含所有字段的完整依赖项对象。
+ */
 function normalizeDeps(overrides: ConfigIoDeps = {}): Required<ConfigIoDeps> {
   return {
     fs: overrides.fs ?? fs,
@@ -651,15 +876,24 @@ function normalizeDeps(overrides: ConfigIoDeps = {}): Required<ConfigIoDeps> {
   };
 }
 
+/**
+ * 尝试为当前进程环境加载 `.env` 文件。
+ * 仅在操作真实 `process.env` 时执行，以隔离测试环境。
+ * @param env 进程环境变量。
+ */
 function maybeLoadDotEnvForConfig(env: NodeJS.ProcessEnv): void {
-  // Only hydrate dotenv for the real process env. Callers using injected env
-  // objects (tests/diagnostics) should stay isolated.
   if (env !== process.env) {
     return;
   }
   loadDotEnv({ quiet: true });
 }
 
+/**
+ * 使用 JSON5 解析器解析字符串。
+ * @param raw 要解析的字符串。
+ * @param json5 JSON5 解析器实例。
+ * @returns 成功则返回解析后的对象，失败则返回错误信息。
+ */
 export function parseConfigJson5(
   raw: string,
   json5: { parse: (value: string) => unknown } = JSON5,
@@ -671,12 +905,20 @@ export function parseConfigJson5(
   }
 }
 
+// 配置读取解析的结果类型。
 type ConfigReadResolution = {
-  resolvedConfigRaw: unknown;
-  envSnapshotForRestore: Record<string, string | undefined>;
-  envWarnings: EnvSubstitutionWarning[];
+  resolvedConfigRaw: unknown; // 解析了 includes 和 env 后的原始配置
+  envSnapshotForRestore: Record<string, string | undefined>; // 用于恢复的环境变量快照
+  envWarnings: EnvSubstitutionWarning[]; // 环境变量替换过程中的警告
 };
 
+/**
+ * 在读取配置时，解析其中的 `$include` 指令。
+ * @param parsed 初始解析的配置对象。
+ * @param configPath 配置文件路径。
+ * @param deps 依赖项。
+ * @returns 解析了 includes 后的配置对象。
+ */
 function resolveConfigIncludesForRead(
   parsed: unknown,
   configPath: string,
@@ -695,46 +937,65 @@ function resolveConfigIncludesForRead(
   });
 }
 
+/**
+ * 在读取配置时，解析其中的环境变量引用 (`${VAR}`)。
+ * @param resolvedIncludes 已解析 includes 的配置对象。
+ * @param env 环境变量。
+ * @returns 包含解析结果、快照和警告的对象。
+ */
 function resolveConfigForRead(
   resolvedIncludes: unknown,
   env: NodeJS.ProcessEnv,
 ): ConfigReadResolution {
-  // Apply config.env to process.env BEFORE substitution so ${VAR} can reference config-defined vars.
+  // 在替换 ${VAR} 之前，先将 config.env 应用到 process.env，这样可以引用配置中定义的变量。
   if (resolvedIncludes && typeof resolvedIncludes === "object" && "env" in resolvedIncludes) {
     applyConfigEnvVars(resolvedIncludes as OpenClawConfig, env);
   }
 
-  // Collect missing env var references as warnings instead of throwing,
-  // so non-critical config sections with unset vars don't crash the gateway.
+  // 将缺失的环境变量引用收集为警告而不是抛出错误，
+  // 这样即使非关键配置部分的变量未设置，网关也能启动。
   const envWarnings: EnvSubstitutionWarning[] = [];
   return {
     resolvedConfigRaw: resolveConfigEnvVars(resolvedIncludes, env, {
       onMissing: (w) => envWarnings.push(w),
     }),
-    // Capture env snapshot after substitution for write-time ${VAR} restoration.
+    // 捕获替换后的环境变量快照，用于写入时恢复 ${VAR}。
     envSnapshotForRestore: { ...env } as Record<string, string | undefined>,
     envWarnings,
   };
 }
 
+// 读取配置文件快照的内部结果类型。
 type ReadConfigFileSnapshotInternalResult = {
   snapshot: ConfigFileSnapshot;
   envSnapshotForRestore?: Record<string, string | undefined>;
 };
 
+/**
+ * 创建一个配置 I/O 操作的实例。
+ * 这是本文件的主要入口点，返回一个包含所有核心操作方法的对象。
+ * @param overrides 用户提供的依赖项覆盖。
+ * @returns 一个包含配置操作方法的对象。
+ */
 export function createConfigIO(overrides: ConfigIoDeps = {}) {
   const deps = normalizeDeps(overrides);
   const requestedConfigPath = resolveConfigPathForDeps(deps);
+  // 查找实际存在的配置文件路径。
   const candidatePaths = deps.configPath
     ? [requestedConfigPath]
     : resolveDefaultConfigCandidates(deps.env, deps.homedir);
   const configPath =
     candidatePaths.find((candidate) => deps.fs.existsSync(candidate)) ?? requestedConfigPath;
 
+  /**
+   * 加载、解析、验证并返回最终的配置对象。
+   * 这是应用获取配置的主要函数。
+   */
   function loadConfig(): OpenClawConfig {
     try {
       maybeLoadDotEnvForConfig(deps.env);
       if (!deps.fs.existsSync(configPath)) {
+        // 如果配置文件不存在，尝试加载 shell 环境作为回退。
         if (shouldEnableShellEnvFallback(deps.env) && !shouldDeferShellEnvFallback(deps.env)) {
           loadShellEnvFallback({
             enabled: true,
@@ -748,11 +1009,13 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       }
       const raw = deps.fs.readFileSync(configPath, "utf-8");
       const parsed = deps.json5.parse(raw);
+      // 解析 includes 和 env vars
       const readResolution = resolveConfigForRead(
         resolveConfigIncludesForRead(parsed, configPath, deps),
         deps.env,
       );
       const resolvedConfig = readResolution.resolvedConfigRaw;
+      // 打印环境变量缺失的警告
       for (const w of readResolution.envWarnings) {
         deps.logger.warn(
           `Config (${configPath}): missing env var "${w.varName}" at ${w.configPath} — feature using this value will be unavailable`,
@@ -762,6 +1025,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       if (typeof resolvedConfig !== "object" || resolvedConfig === null) {
         return {};
       }
+      // 验证前检查重复的 agent 目录
       const preValidationDuplicates = findDuplicateAgentDirs(resolvedConfig as OpenClawConfig, {
         env: deps.env,
         homedir: deps.homedir,
@@ -769,6 +1033,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       if (preValidationDuplicates.length > 0) {
         throw new DuplicateAgentDirError(preValidationDuplicates);
       }
+      // 验证配置对象
       const validated = validateConfigObjectWithPlugins(resolvedConfig);
       if (!validated.ok) {
         const details = validated.issues
@@ -786,6 +1051,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         (error as { code?: string; details?: string }).details = details;
         throw error;
       }
+      // 打印验证警告
       if (validated.warnings.length > 0) {
         const details = validated.warnings
           .map(
@@ -796,6 +1062,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         deps.logger.warn(`Config warnings:\\n${details}`);
       }
       warnIfConfigFromFuture(validated.config, deps.logger);
+      // 应用一系列默认值和规范化
       const cfg = applyTalkConfigNormalization(
         applyModelDefaults(
           applyCompactionDefaults(
@@ -810,6 +1077,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       normalizeConfigPaths(cfg);
       normalizeExecSafeBinProfilesInConfig(cfg);
 
+      // 再次检查重复的 agent 目录
       const duplicates = findDuplicateAgentDirs(cfg, {
         env: deps.env,
         homedir: deps.homedir,
@@ -820,6 +1088,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
 
       applyConfigEnvVars(cfg, deps.env);
 
+      // 加载 shell 环境变量
       const enabled = shouldEnableShellEnvFallback(deps.env) || cfg.env?.shellEnv?.enabled === true;
       if (enabled && !shouldDeferShellEnvFallback(deps.env)) {
         loadShellEnvFallback({
@@ -831,6 +1100,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         });
       }
 
+      // 确保并可能自动生成 ownerDisplaySecret
       const pendingSecret = AUTO_OWNER_DISPLAY_SECRET_BY_PATH.get(configPath);
       const ownerDisplaySecretResolution = ensureOwnerDisplaySecret(
         cfg,
@@ -838,6 +1108,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       );
       const cfgWithOwnerDisplaySecret = ownerDisplaySecretResolution.config;
       if (ownerDisplaySecretResolution.generatedSecret) {
+        // 如果生成了新密钥，则异步写回配置文件
         AUTO_OWNER_DISPLAY_SECRET_BY_PATH.set(
           configPath,
           ownerDisplaySecretResolution.generatedSecret,
@@ -866,6 +1137,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         AUTO_OWNER_DISPLAY_SECRET_PERSIST_WARNED.delete(configPath);
       }
 
+      // 应用运行时覆盖并返回最终配置
       return applyConfigOverrides(cfgWithOwnerDisplaySecret);
     } catch (err) {
       if (err instanceof DuplicateAgentDirError) {
@@ -874,7 +1146,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       }
       const error = err as { code?: string };
       if (error?.code === "INVALID_CONFIG") {
-        // Fail closed so invalid configs cannot silently fall back to permissive defaults.
+        // 对于无效配置，直接失败，避免静默回退到可能不安全的默认值。
         throw err;
       }
       deps.logger.error(`Failed to read config at ${configPath}`, err);
@@ -882,10 +1154,15 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
     }
   }
 
+  /**
+   * 读取配置文件的完整快照，包含原始文本、解析后的对象、验证状态等。
+   * 这是 `writeConfigFile` 和其他需要详细上下文的操作的基础。
+   */
   async function readConfigFileSnapshotInternal(): Promise<ReadConfigFileSnapshotInternalResult> {
     maybeLoadDotEnvForConfig(deps.env);
     const exists = deps.fs.existsSync(configPath);
     if (!exists) {
+      // 如果文件不存在，返回一个表示空配置的快照。
       const hash = hashConfigRaw(null);
       const config = applyTalkApiKey(
         applyTalkConfigNormalization(
@@ -921,6 +1198,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       const hash = hashConfigRaw(raw);
       const parsedRes = parseConfigJson5(raw, deps.json5);
       if (!parsedRes.ok) {
+        // 如果 JSON5 解析失败，返回无效快照。
         return {
           snapshot: {
             path: configPath,
@@ -938,7 +1216,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         };
       }
 
-      // Resolve $include directives
+      // 解析 `$include` 指令
       let resolved: unknown;
       try {
         resolved = resolveConfigIncludesForRead(parsedRes.parsed, configPath, deps);
@@ -964,21 +1242,19 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         };
       }
 
+      // 解析环境变量
       const readResolution = resolveConfigForRead(resolved, deps.env);
 
-      // Convert missing env var references to config warnings instead of fatal errors.
-      // This allows the gateway to start in degraded mode when non-critical config
-      // sections reference unset env vars (e.g. optional provider API keys).
       const envVarWarnings = readResolution.envWarnings.map((w) => ({
         path: w.configPath,
         message: `Missing env var "${w.varName}" — feature using this value will be unavailable`,
       }));
 
       const resolvedConfigRaw = readResolution.resolvedConfigRaw;
-      // Detect legacy keys on resolved config, but only mark source-literal legacy
-      // entries (for auto-migration) when they are present in the parsed source.
+      // 检测遗留配置项
       const legacyIssues = findLegacyConfigIssues(resolvedConfigRaw, parsedRes.parsed);
 
+      // 验证配置
       const validated = validateConfigObjectWithPlugins(resolvedConfigRaw);
       if (!validated.ok) {
         return {
@@ -999,6 +1275,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       }
 
       warnIfConfigFromFuture(validated.config, deps.logger);
+      // 应用规范化
       const snapshotConfig = normalizeConfigPaths(
         applyTalkApiKey(
           applyTalkConfigNormalization(
@@ -1011,14 +1288,13 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         ),
       );
       normalizeExecSafeBinProfilesInConfig(snapshotConfig);
+      // 返回成功的快照
       return {
         snapshot: {
           path: configPath,
           exists: true,
           raw,
           parsed: parsedRes.parsed,
-          // Use resolvedConfigRaw (after $include and ${ENV} substitution but BEFORE runtime defaults)
-          // for config set/unset operations (issue #6070)
           resolved: coerceConfig(resolvedConfigRaw),
           valid: true,
           config: snapshotConfig,
@@ -1033,8 +1309,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       const nodeErr = err as NodeJS.ErrnoException;
       let message: string;
       if (nodeErr?.code === "EACCES") {
-        // Permission denied — common in Docker/container deployments where the
-        // config file is owned by root but the gateway runs as a non-root user.
+        // 处理权限错误
         const uid = process.getuid?.();
         const uidHint = typeof uid === "number" ? String(uid) : "$(id -u)";
         message = [
@@ -1067,11 +1342,17 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
     }
   }
 
+  /**
+   * 读取配置文件的快照（公共接口）。
+   */
   async function readConfigFileSnapshot(): Promise<ConfigFileSnapshot> {
     const result = await readConfigFileSnapshotInternal();
     return result.snapshot;
   }
 
+  /**
+   * 为写入操作读取配置文件的快照，同时返回写入所需的选项。
+   */
   async function readConfigFileSnapshotForWrite(): Promise<ReadConfigFileSnapshotForWriteResult> {
     const result = await readConfigFileSnapshotInternal();
     return {
@@ -1083,6 +1364,11 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
     };
   }
 
+  /**
+   * 将配置对象写入文件。
+   * @param cfg 要写入的配置对象。
+   * @param options 写入选项。
+   */
   async function writeConfigFile(cfg: OpenClawConfig, options: ConfigWriteOptions = {}) {
     clearConfigCache();
     let persistCandidate: unknown = cfg;
@@ -1090,9 +1376,11 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
     let envRefMap: Map<string, string> | null = null;
     let changedPaths: Set<string> | null = null;
     if (snapshot.valid && snapshot.exists) {
+      // 基于当前配置和快照创建补丁，以应用变更。
       const patch = createMergePatch(snapshot.config, cfg);
       persistCandidate = applyMergePatch(snapshot.resolved, patch);
       try {
+        // 收集原始文件中的环境变量引用，用于恢复。
         const resolvedIncludes = resolveConfigIncludes(snapshot.parsed, configPath, {
           readFile: (candidate) => deps.fs.readFileSync(candidate, "utf-8"),
           readFileWithGuards: ({ includePath, resolvedPath, rootRealDir }) =>
@@ -1116,6 +1404,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       }
     }
 
+    // 验证待持久化的配置
     const validated = validateConfigObjectRawWithPlugins(persistCandidate);
     if (!validated.ok) {
       const issue = validated.issues[0];
@@ -1130,24 +1419,13 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       deps.logger.warn(`Config warnings:\n${details}`);
     }
 
-    // Restore ${VAR} env var references that were resolved during config loading.
-    // Read the current file (pre-substitution) and restore any references whose
-    // resolved values match the incoming config — so we don't overwrite
-    // "${ANTHROPIC_API_KEY}" with "sk-ant-..." when the caller didn't change it.
-    //
-    // We use only the root file's parsed content (no $include resolution) to avoid
-    // pulling values from included files into the root config on write-back.
-    // Apply env restoration to validated.config (which has runtime defaults stripped
-    // per issue #6070) rather than the raw caller input.
+    // 智能地恢复环境变量引用，避免将敏感值写入文件。
     let cfgToWrite = validated.config;
     try {
       if (deps.fs.existsSync(configPath)) {
         const currentRaw = await deps.fs.promises.readFile(configPath, "utf-8");
         const parsedRes = parseConfigJson5(currentRaw, deps.json5);
         if (parsedRes.ok) {
-          // Use env snapshot from when config was loaded (if available) to avoid
-          // TOCTOU issues where env changes between load and write. Falls back to
-          // live env if no snapshot exists (e.g., first write before any load).
           const envForRestore = options.envSnapshotForRestore ?? deps.env;
           cfgToWrite = restoreEnvVarRefs(
             cfgToWrite,
@@ -1157,7 +1435,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         }
       }
     } catch {
-      // If reading the current file fails, write cfg as-is (no env restoration)
+      // 如果读取当前文件失败，则按原样写入 cfg（不恢复环境变量）。
     }
 
     const dir = path.dirname(configPath);
@@ -1168,11 +1446,13 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       homedir: deps.homedir,
       fsModule: deps.fs,
     });
+    // 再次恢复环境变量引用
     const outputConfigBase =
       envRefMap && changedPaths
         ? (restoreEnvRefsFromMap(cfgToWrite, "", envRefMap, changedPaths) as OpenClawConfig)
         : cfgToWrite;
     let outputConfig = outputConfigBase;
+    // 处理 unsetPaths
     if (options.unsetPaths?.length) {
       for (const unsetPath of options.unsetPaths) {
         if (!Array.isArray(unsetPath) || unsetPath.length === 0) {
@@ -1184,8 +1464,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         }
       }
     }
-    // Do NOT apply runtime defaults when writing — user config should only contain
-    // explicitly set values. Runtime defaults are applied when loading (issue #6070).
+    // 添加版本和时间戳，然后序列化为 JSON
     const stampedOutputConfig = stampConfigVersion(outputConfig);
     const json = JSON.stringify(stampedOutputConfig, null, 2).trimEnd().concat("\n");
     const nextHash = hashConfigRaw(json);
@@ -1198,6 +1477,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
     const hasMetaAfter = hasConfigMeta(stampedOutputConfig);
     const gatewayModeBefore = resolveGatewayMode(snapshot.resolved);
     const gatewayModeAfter = resolveGatewayMode(stampedOutputConfig);
+    // 检查可疑变更
     const suspiciousReasons = resolveConfigWriteSuspiciousReasons({
       existsBefore: snapshot.exists,
       previousBytes,
@@ -1206,6 +1486,8 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       gatewayModeBefore,
       gatewayModeAfter,
     });
+
+    // 记录覆盖日志
     const logConfigOverwrite = () => {
       if (!snapshot.exists) {
         return;
@@ -1221,11 +1503,11 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         `Config overwrite: ${configPath} (sha256 ${previousHash ?? "unknown"} -> ${nextHash}, backup=${configPath}.bak${changeSummary})`,
       );
     };
+    // 记录异常写入日志
     const logConfigWriteAnomalies = () => {
       if (suspiciousReasons.length === 0) {
         return;
       }
-      // Tests often write minimal configs (missing meta, etc); keep output quiet unless requested.
       const isVitest = deps.env.VITEST === "true";
       const shouldLogInVitest = deps.env.OPENCLAW_TEST_CONFIG_WRITE_ANOMALY_LOG === "1";
       if (isVitest && !shouldLogInVitest) {
@@ -1233,6 +1515,8 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       }
       deps.logger.warn(`Config write anomaly: ${configPath} (${suspiciousReasons.join(", ")})`);
     };
+
+    // 准备审计记录
     const auditRecordBase = {
       ts: new Date().toISOString(),
       source: "config-io" as const,
@@ -1266,6 +1550,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       gatewayModeAfter,
       suspicious: suspiciousReasons,
     };
+    // 追加写入审计日志的函数
     const appendWriteAudit = async (result: ConfigWriteAuditResult, err?: unknown) => {
       const errorCode =
         err && typeof err === "object" && "code" in err && typeof err.code === "string"
@@ -1285,6 +1570,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       });
     };
 
+    // 使用临时文件实现原子写入
     const tmp = path.join(
       dir,
       `${path.basename(configPath)}.${process.pid}.${crypto.randomUUID()}.tmp`,
@@ -1304,23 +1590,17 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         await deps.fs.promises.rename(tmp, configPath);
       } catch (err) {
         const code = (err as { code?: string }).code;
-        // Windows doesn't reliably support atomic replace via rename when dest exists.
+        // 在 Windows 上，rename 可能因为文件已存在而失败，回退到 copy + unlink
         if (code === "EPERM" || code === "EEXIST") {
           await deps.fs.promises.copyFile(tmp, configPath);
-          await deps.fs.promises.chmod(configPath, 0o600).catch(() => {
-            // best-effort
-          });
-          await deps.fs.promises.unlink(tmp).catch(() => {
-            // best-effort
-          });
+          await deps.fs.promises.chmod(configPath, 0o600).catch(() => {});
+          await deps.fs.promises.unlink(tmp).catch(() => {});
           logConfigOverwrite();
           logConfigWriteAnomalies();
           await appendWriteAudit("copy-fallback");
           return;
         }
-        await deps.fs.promises.unlink(tmp).catch(() => {
-          // best-effort
-        });
+        await deps.fs.promises.unlink(tmp).catch(() => {});
         throw err;
       }
       logConfigOverwrite();
@@ -1341,10 +1621,10 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
   };
 }
 
-// NOTE: These wrappers intentionally do *not* cache the resolved config path at
-// module scope. `OPENCLAW_CONFIG_PATH` (and friends) are expected to work even
-// when set after the module has been imported (tests, one-off scripts, etc.).
-const DEFAULT_CONFIG_CACHE_MS = 200;
+// ---- 全局缓存和运行时快照 ----
+// 这些包装器故意不在模块作用域缓存解析的配置路径，
+// 以便 `OPENCLAW_CONFIG_PATH` 等环境变量在模块导入后设置仍然有效。
+const DEFAULT_CONFIG_CACHE_MS = 200; // 默认缓存时间
 const AUTO_OWNER_DISPLAY_SECRET_BY_PATH = new Map<string, string>();
 const AUTO_OWNER_DISPLAY_SECRET_PERSIST_IN_FLIGHT = new Set<string>();
 const AUTO_OWNER_DISPLAY_SECRET_PERSIST_WARNED = new Set<string>();
@@ -1379,10 +1659,17 @@ function shouldUseConfigCache(env: NodeJS.ProcessEnv): boolean {
   return resolveConfigCacheMs(env) > 0;
 }
 
+/** 清除全局配置缓存。 */
 export function clearConfigCache(): void {
   configCache = null;
 }
 
+/**
+ * 设置运行时配置快照。
+ * 这用于支持配置的热重载。
+ * @param config 应用了所有默认值和解析的配置。
+ * @param sourceConfig 未解析默认值的源配置。
+ */
 export function setRuntimeConfigSnapshot(
   config: OpenClawConfig,
   sourceConfig?: OpenClawConfig,
@@ -1392,16 +1679,19 @@ export function setRuntimeConfigSnapshot(
   clearConfigCache();
 }
 
+/** 清除运行时配置快照。 */
 export function clearRuntimeConfigSnapshot(): void {
   runtimeConfigSnapshot = null;
   runtimeConfigSourceSnapshot = null;
   clearConfigCache();
 }
 
+/** 获取当前的运行时配置快照。 */
 export function getRuntimeConfigSnapshot(): OpenClawConfig | null {
   return runtimeConfigSnapshot;
 }
 
+/** 获取当前的运行时源配置快照。 */
 export function getRuntimeConfigSourceSnapshot(): OpenClawConfig | null {
   return runtimeConfigSourceSnapshot;
 }
@@ -1435,6 +1725,12 @@ function isCompatibleTopLevelRuntimeProjectionShape(params: {
   return true;
 }
 
+/**
+ * 将一个配置对象的变更“投影”回源快照上。
+ * 这用于在写入文件前，将基于运行时快照的变更应用回原始的、未解析的配置结构上。
+ * @param config 发生了变更的配置对象。
+ * @returns 应用了变更的源配置对象。
+ */
 export function projectConfigOntoRuntimeSourceSnapshot(config: OpenClawConfig): OpenClawConfig {
   if (!runtimeConfigSnapshot || !runtimeConfigSourceSnapshot) {
     return config;
@@ -1442,10 +1738,9 @@ export function projectConfigOntoRuntimeSourceSnapshot(config: OpenClawConfig): 
   if (config === runtimeConfigSnapshot) {
     return runtimeConfigSourceSnapshot;
   }
-  // This projection expects callers to pass config objects derived from the
-  // active runtime snapshot (for example shallow/deep clones with targeted edits).
-  // For structurally unrelated configs, skip projection to avoid accidental
-  // merge-patch deletions or reintroducing resolved values into source refs.
+  // 这种投影期望调用者传递从活动运行时快照派生的配置对象
+  // （例如，带有目标编辑的浅/深克隆）。
+  // 对于结构不相关的配置，跳过投影以避免意外的合并补丁删除或将解析的值重新引入源引用。
   if (
     !isCompatibleTopLevelRuntimeProjectionShape({
       runtimeSnapshot: runtimeConfigSnapshot,
@@ -1458,12 +1753,17 @@ export function projectConfigOntoRuntimeSourceSnapshot(config: OpenClawConfig): 
   return coerceConfig(applyMergePatch(runtimeConfigSourceSnapshot, runtimePatch));
 }
 
+/** 设置运行时配置快照的刷新处理器。 */
 export function setRuntimeConfigSnapshotRefreshHandler(
   refreshHandler: RuntimeConfigSnapshotRefreshHandler | null,
 ): void {
   runtimeConfigSnapshotRefreshHandler = refreshHandler;
 }
 
+/**
+ * 加载配置的全局快捷函数。
+ * 会利用缓存和运行时快照。
+ */
 export function loadConfig(): OpenClawConfig {
   if (runtimeConfigSnapshot) {
     return runtimeConfigSnapshot;
@@ -1491,19 +1791,28 @@ export function loadConfig(): OpenClawConfig {
   return config;
 }
 
+/**
+ * 尽力读取配置。如果配置有效，则加载完整配置；如果无效，则返回快照中未经验证的配置对象。
+ */
 export async function readBestEffortConfig(): Promise<OpenClawConfig> {
   const snapshot = await readConfigFileSnapshot();
   return snapshot.valid ? loadConfig() : snapshot.config;
 }
 
+/** 读取配置文件快照的全局快捷函数。 */
 export async function readConfigFileSnapshot(): Promise<ConfigFileSnapshot> {
   return await createConfigIO().readConfigFileSnapshot();
 }
 
+/** 为写入操作读取配置文件快照的全局快捷函数。 */
 export async function readConfigFileSnapshotForWrite(): Promise<ReadConfigFileSnapshotForWriteResult> {
   return await createConfigIO().readConfigFileSnapshotForWrite();
 }
 
+/**
+ * 写入配置文件的全局快捷函数。
+ * 会处理运行时快照的投影和刷新。
+ */
 export async function writeConfigFile(
   cfg: OpenClawConfig,
   options: ConfigWriteOptions = {},
@@ -1513,6 +1822,7 @@ export async function writeConfigFile(
   const hadRuntimeSnapshot = Boolean(runtimeConfigSnapshot);
   const hadBothSnapshots = Boolean(runtimeConfigSnapshot && runtimeConfigSourceSnapshot);
   if (hadBothSnapshots) {
+    // 如果存在运行时快照，则将变更应用到源快照上。
     const runtimePatch = createMergePatch(runtimeConfigSnapshot!, cfg);
     nextCfg = coerceConfig(applyMergePatch(runtimeConfigSourceSnapshot!, runtimePatch));
   }
@@ -1522,8 +1832,7 @@ export async function writeConfigFile(
     envSnapshotForRestore: sameConfigPath ? options.envSnapshotForRestore : undefined,
     unsetPaths: options.unsetPaths,
   });
-  // Keep the last-known-good runtime snapshot active until the specialized refresh path
-  // succeeds, so concurrent readers do not observe unresolved SecretRefs mid-refresh.
+  // 写入后，如果存在刷新处理器，则调用它来更新运行时状态。
   const refreshHandler = runtimeConfigSnapshotRefreshHandler;
   if (refreshHandler) {
     try {
@@ -1535,7 +1844,7 @@ export async function writeConfigFile(
       try {
         refreshHandler.clearOnRefreshFailure?.();
       } catch {
-        // Keep the original refresh failure as the surfaced error.
+        // 保留原始刷新失败作为表面错误。
       }
       const detail = error instanceof Error ? error.message : String(error);
       throw new ConfigRuntimeRefreshError(
@@ -1545,8 +1854,8 @@ export async function writeConfigFile(
     }
   }
   if (hadBothSnapshots) {
-    // Refresh both snapshots from disk atomically so follow-up reads get normalized config and
-    // subsequent writes still get secret-preservation merge-patch (hadBothSnapshots stays true).
+    // 从磁盘原子地刷新两个快照，以便后续读取获得规范化配置，
+    // 并且后续写入仍然可以获得秘密保留合并补丁（hadBothSnapshots 保持为 true）。
     const fresh = io.loadConfig();
     setRuntimeConfigSnapshot(fresh, nextCfg);
     return;
@@ -1554,6 +1863,6 @@ export async function writeConfigFile(
   if (hadRuntimeSnapshot) {
     clearRuntimeConfigSnapshot();
   }
-  // When we had no runtime snapshot, keep callers reading from disk/cache so external/manual
-  // edits to openclaw.json remain visible (no stale snapshot).
+  // 当我们没有运行时快照时，让调用者从磁盘/缓存中读取，以便外部/手动
+  // 对 openclaw.json 的编辑保持可见（没有过时的快照）。
 }

@@ -1,5 +1,28 @@
+/**
+ * ACP网关Agent实现
+ * 
+ * 功能概述：
+ * 实现ACP协议与OpenClaw网关之间的协议转换
+ * 
+ * 主要功能：
+ * 1. 处理ACP协议请求（认证、初始化、提示等）
+ * 2. 管理会话生命周期
+ * 3. 转换网关事件为ACP通知
+ * 4. 管理工具调用
+ * 5. 处理会话配置
+ * 
+ * 架构：
+ * - AcpGatewayAgent类实现Agent接口
+ * - 使用AgentSideConnection处理ACP协议
+ * - 使用GatewayClient与网关通信
+ */
+
 import { randomUUID } from "node:crypto";
+// 导入UUID生成函数
+
 import os from "node:os";
+// 导入操作系统模块
+
 import type {
   Agent,
   AgentSideConnection,
@@ -26,17 +49,35 @@ import type {
   ToolCallLocation,
   ToolKind,
 } from "@agentclientprotocol/sdk";
+// 从ACP SDK导入类型定义
+
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+// 导入协议版本常量
+
 import { listThinkingLevels } from "../auto-reply/thinking.js";
+// 导入思考级别列表
+
 import type { GatewayClient } from "../gateway/client.js";
+// 导入网关客户端类型
+
 import type { EventFrame } from "../gateway/protocol/index.js";
+// 导入事件帧类型
+
 import type { GatewaySessionRow, SessionsListResult } from "../gateway/session-utils.js";
+// 导入网关会话类型
+
 import {
   createFixedWindowRateLimiter,
   type FixedWindowRateLimiter,
 } from "../infra/fixed-window-rate-limit.js";
+// 导入固定窗口速率限制器
+
 import { shortenHomePath } from "../utils.js";
+// 导入路径缩短工具
+
 import { getAvailableCommands } from "./commands.js";
+// 导入可用命令列表
+
 import {
   extractAttachmentsFromPrompt,
   extractToolCallContent,
@@ -45,43 +86,72 @@ import {
   formatToolTitle,
   inferToolKind,
 } from "./event-mapper.js";
-import { readBool, readNumber, readString } from "./meta.js";
-import { parseSessionMeta, resetSessionIfNeeded, resolveSessionKey } from "./session-mapper.js";
-import { defaultAcpSessionStore, type AcpSessionStore } from "./session.js";
-import { ACP_AGENT_INFO, type AcpServerOptions } from "./types.js";
+// 导入事件映射工具
 
-// Maximum allowed prompt size (2MB) to prevent DoS via memory exhaustion (CWE-400, GHSA-cxpw-2g23-2vgw)
+import { readBool, readNumber, readString } from "./meta.js";
+// 导入元数据读取工具
+
+import { parseSessionMeta, resetSessionIfNeeded, resolveSessionKey } from "./session-mapper.js";
+// 导入会话映射工具
+
+import { defaultAcpSessionStore, type AcpSessionStore } from "./session.js";
+// 导入会话存储
+
+import { ACP_AGENT_INFO, type AcpServerOptions } from "./types.js";
+// 导入服务器选项类型
+
+// 最大允许的提示大小（2MB），防止通过内存耗尽进行DoS攻击（CWE-400, GHSA-cxpw-2g23-2vgw）
 const MAX_PROMPT_BYTES = 2 * 1024 * 1024;
-const ACP_THOUGHT_LEVEL_CONFIG_ID = "thought_level";
-const ACP_FAST_MODE_CONFIG_ID = "fast_mode";
-const ACP_VERBOSE_LEVEL_CONFIG_ID = "verbose_level";
-const ACP_REASONING_LEVEL_CONFIG_ID = "reasoning_level";
-const ACP_RESPONSE_USAGE_CONFIG_ID = "response_usage";
-const ACP_ELEVATED_LEVEL_CONFIG_ID = "elevated_level";
+
+// ACP配置ID常量
+const ACP_THOUGHT_LEVEL_CONFIG_ID = "thought_level"; // 思考级别
+const ACP_FAST_MODE_CONFIG_ID = "fast_mode"; // 快速模式
+const ACP_VERBOSE_LEVEL_CONFIG_ID = "verbose_level"; // 详细级别
+const ACP_REASONING_LEVEL_CONFIG_ID = "reasoning_level"; // 推理级别
+const ACP_RESPONSE_USAGE_CONFIG_ID = "response_usage"; // 响应使用信息
+const ACP_ELEVATED_LEVEL_CONFIG_ID = "elevated_level"; // 提升级别
+
+// 加载会话时的重放限制（100万条消息）
 const ACP_LOAD_SESSION_REPLAY_LIMIT = 1_000_000;
 
+/**
+ * 待处理的提示
+ * 存储等待网关响应的提示信息
+ */
 type PendingPrompt = {
-  sessionId: string;
-  sessionKey: string;
-  idempotencyKey: string;
-  resolve: (response: PromptResponse) => void;
-  reject: (err: Error) => void;
-  sentTextLength?: number;
-  sentText?: string;
-  toolCalls?: Map<string, PendingToolCall>;
+  sessionId: string; // 会话ID
+  sessionKey: string; // 会话密钥
+  idempotencyKey: string; // 幂等性键
+  resolve: (response: PromptResponse) => void; // 解析函数
+  reject: (err: Error) => void; // 拒绝函数
+  sentTextLength?: number; // 已发送文本长度
+  sentText?: string; // 已发送文本
+  toolCalls?: Map<string, PendingToolCall>; // 工具调用映射
 };
 
+/**
+ * 待处理的工具调用
+ * 存储工具调用的相关信息
+ */
 type PendingToolCall = {
-  kind: ToolKind;
-  locations?: ToolCallLocation[];
-  rawInput?: Record<string, unknown>;
-  title: string;
+  kind: ToolKind; // 工具类型
+  locations?: ToolCallLocation[]; // 工具调用位置
+  rawInput?: Record<string, unknown>; // 原始输入
+  title: string; // 工具标题
 };
 
+/**
+ * ACP网关Agent选项
+ * 扩展自AcpServerOptions，添加会话存储选项
+ */
 type AcpGatewayAgentOptions = AcpServerOptions & {
-  sessionStore?: AcpSessionStore;
+  sessionStore?: AcpSessionStore; // 自定义会话存储
 };
 
+/**
+ * 网关会话展示行
+ * 从GatewaySessionRow中选择用于展示的字段
+ */
 type GatewaySessionPresentationRow = Pick<
   GatewaySessionRow,
   | "displayName"
@@ -101,34 +171,57 @@ type GatewaySessionPresentationRow = Pick<
   | "contextTokens"
 >;
 
+/**
+ * 会话展示信息
+ * 包含配置选项和模式状态
+ */
 type SessionPresentation = {
-  configOptions: SessionConfigOption[];
-  modes: SessionModeState;
+  configOptions: SessionConfigOption[]; // 配置选项列表
+  modes: SessionModeState; // 模式状态
 };
 
+/**
+ * 会话元数据
+ */
 type SessionMetadata = {
-  title?: string | null;
-  updatedAt?: string | null;
+  title?: string | null; // 会话标题
+  updatedAt?: string | null; // 更新时间
 };
 
+/**
+ * 会话使用快照
+ */
 type SessionUsageSnapshot = {
-  size: number;
-  used: number;
+  size: number; // 总大小
+  used: number; // 已使用量
 };
 
+/**
+ * 会话快照
+ * 包含展示信息、元数据和使用情况
+ */
 type SessionSnapshot = SessionPresentation & {
-  metadata?: SessionMetadata;
-  usage?: SessionUsageSnapshot;
+  metadata?: SessionMetadata; // 元数据
+  usage?: SessionUsageSnapshot; // 使用情况
 };
 
+/**
+ * 网关转录消息
+ */
 type GatewayTranscriptMessage = {
-  role?: unknown;
-  content?: unknown;
+  role?: unknown; // 角色
+  content?: unknown; // 内容
 };
 
-const SESSION_CREATE_RATE_LIMIT_DEFAULT_MAX_REQUESTS = 120;
-const SESSION_CREATE_RATE_LIMIT_DEFAULT_WINDOW_MS = 10_000;
+// 会话创建速率限制默认值
+const SESSION_CREATE_RATE_LIMIT_DEFAULT_MAX_REQUESTS = 120; // 最大请求数
+const SESSION_CREATE_RATE_LIMIT_DEFAULT_WINDOW_MS = 10_000; // 时间窗口（毫秒）
 
+/**
+ * 格式化思考级别名称
+ * @param level - 思考级别
+ * @returns 格式化后的名称
+ */
 function formatThinkingLevelName(level: string): string {
   switch (level) {
     case "xhigh":
@@ -136,10 +229,16 @@ function formatThinkingLevelName(level: string): string {
     case "adaptive":
       return "Adaptive";
     default:
+      // 首字母大写，其余保持不变
       return level.length > 0 ? `${level[0].toUpperCase()}${level.slice(1)}` : "Unknown";
   }
 }
 
+/**
+ * 构建思考模式描述
+ * @param level - 思考级别
+ * @returns 描述文本，非adaptive级别返回undefined
+ */
 function buildThinkingModeDescription(level: string): string | undefined {
   if (level === "adaptive") {
     return "Use the Gateway session default thought level.";
@@ -147,25 +246,36 @@ function buildThinkingModeDescription(level: string): string | undefined {
   return undefined;
 }
 
+/**
+ * 格式化配置值名称
+ * @param value - 配置值
+ * @returns 格式化后的名称
+ */
 function formatConfigValueName(value: string): string {
   switch (value) {
     case "xhigh":
       return "Extra High";
     default:
+      // 首字母大写，其余保持不变
       return value.length > 0 ? `${value[0].toUpperCase()}${value.slice(1)}` : "Unknown";
   }
 }
 
+/**
+ * 构建选择配置选项
+ * @param params - 配置参数
+ * @returns 会话配置选项
+ */
 function buildSelectConfigOption(params: {
-  id: string;
-  name: string;
-  description: string;
-  currentValue: string;
-  values: readonly string[];
-  category?: string;
+  id: string; // 配置ID
+  name: string; // 配置名称
+  description: string; // 配置描述
+  currentValue: string; // 当前值
+  values: readonly string[]; // 可选值列表
+  category?: string; // 配置类别
 }): SessionConfigOption {
   return {
-    type: "select",
+    type: "select", // 选择类型
     id: params.id,
     name: params.name,
     category: params.category,
@@ -173,35 +283,47 @@ function buildSelectConfigOption(params: {
     currentValue: params.currentValue,
     options: params.values.map((value) => ({
       value,
-      name: formatConfigValueName(value),
+      name: formatConfigValueName(value), // 格式化选项名称
     })),
   };
 }
 
+/**
+ * 构建会话展示信息
+ * @param params - 构建参数
+ * @returns 会话展示信息
+ */
 function buildSessionPresentation(params: {
-  row?: GatewaySessionPresentationRow;
-  overrides?: Partial<GatewaySessionPresentationRow>;
+  row?: GatewaySessionPresentationRow; // 网关会话行
+  overrides?: Partial<GatewaySessionPresentationRow>; // 覆盖值
 }): SessionPresentation {
+  // 合并行数据和覆盖值
   const row = {
     ...params.row,
     ...params.overrides,
   };
+  // 获取可用的思考级别列表
   const availableLevelIds: string[] = [...listThinkingLevels(row.modelProvider, row.model)];
+  // 获取当前模式ID，默认为adaptive
   const currentModeId = row.thinkingLevel?.trim() || "adaptive";
+  // 如果当前模式不在可用列表中，添加它
   if (!availableLevelIds.includes(currentModeId)) {
     availableLevelIds.push(currentModeId);
   }
 
+  // 构建模式状态
   const modes: SessionModeState = {
     currentModeId,
     availableModes: availableLevelIds.map((level) => ({
       id: level,
-      name: formatThinkingLevelName(level),
-      description: buildThinkingModeDescription(level),
+      name: formatThinkingLevelName(level), // 格式化级别名称
+      description: buildThinkingModeDescription(level), // 构建级别描述
     })),
   };
 
+  // 构建配置选项列表
   const configOptions: SessionConfigOption[] = [
+    // 思考级别配置
     buildSelectConfigOption({
       id: ACP_THOUGHT_LEVEL_CONFIG_ID,
       name: "Thought level",
@@ -211,6 +333,7 @@ function buildSessionPresentation(params: {
       currentValue: currentModeId,
       values: availableLevelIds,
     }),
+    // 快速模式配置
     buildSelectConfigOption({
       id: ACP_FAST_MODE_CONFIG_ID,
       name: "Fast mode",
@@ -218,6 +341,7 @@ function buildSessionPresentation(params: {
       currentValue: row.fastMode ? "on" : "off",
       values: ["off", "on"],
     }),
+    // 工具详细度配置
     buildSelectConfigOption({
       id: ACP_VERBOSE_LEVEL_CONFIG_ID,
       name: "Tool verbosity",
@@ -226,6 +350,7 @@ function buildSessionPresentation(params: {
       currentValue: row.verboseLevel?.trim() || "off",
       values: ["off", "on", "full"],
     }),
+    // 推理流配置
     buildSelectConfigOption({
       id: ACP_REASONING_LEVEL_CONFIG_ID,
       name: "Reasoning stream",
@@ -233,6 +358,7 @@ function buildSessionPresentation(params: {
       currentValue: row.reasoningLevel?.trim() || "off",
       values: ["off", "on", "stream"],
     }),
+    // 使用信息配置
     buildSelectConfigOption({
       id: ACP_RESPONSE_USAGE_CONFIG_ID,
       name: "Usage detail",
@@ -241,6 +367,7 @@ function buildSessionPresentation(params: {
       currentValue: row.responseUsage?.trim() || "off",
       values: ["off", "tokens", "full"],
     }),
+    // 提升操作配置
     buildSelectConfigOption({
       id: ACP_ELEVATED_LEVEL_CONFIG_ID,
       name: "Elevated actions",

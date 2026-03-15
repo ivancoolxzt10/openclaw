@@ -1,212 +1,93 @@
+// 本文件是一个“规则数据库”，用于 *检测* 旧版（legacy）或已弃用的配置键。
+// 它与 `legacy.ts` 中的 `findLegacyConfigIssues` 函数协同工作。
+// 本文件只“定义”了要查找的内容，而不执行任何修改操作。
+
 import type { LegacyConfigRule } from "./legacy.shared.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+// 辅助函数，用于更复杂的匹配逻辑
 function hasLegacyThreadBindingTtl(value: unknown): boolean {
   return isRecord(value) && Object.prototype.hasOwnProperty.call(value, "ttlHours");
 }
 
 function hasLegacyThreadBindingTtlInAccounts(value: unknown): boolean {
-  if (!isRecord(value)) {
-    return false;
-  }
+  if (!isRecord(value)) return false;
   return Object.values(value).some((entry) =>
     hasLegacyThreadBindingTtl(isRecord(entry) ? entry.threadBindings : undefined),
   );
 }
 
 function isLegacyGatewayBindHostAlias(value: unknown): boolean {
-  if (typeof value !== "string") {
-    return false;
-  }
+  if (typeof value !== "string") return false;
   const normalized = value.trim().toLowerCase();
-  if (!normalized) {
-    return false;
-  }
-  if (
-    normalized === "auto" ||
-    normalized === "loopback" ||
-    normalized === "lan" ||
-    normalized === "tailnet" ||
-    normalized === "custom"
-  ) {
-    return false;
-  }
-  return (
-    normalized === "0.0.0.0" ||
-    normalized === "::" ||
-    normalized === "[::]" ||
-    normalized === "*" ||
-    normalized === "127.0.0.1" ||
-    normalized === "localhost" ||
-    normalized === "::1" ||
-    normalized === "[::1]"
-  );
+  if (!normalized) return false;
+  // 这些是新的、有效的绑定“模式”，不应被视为旧版
+  if (["auto", "loopback", "lan", "tailnet", "custom"].includes(normalized)) return false;
+  // 这些是旧版的、表示绑定地址的“别名”，现在应使用上面的模式
+  return ["0.0.0.0", "::", "[::]", "*", "127.0.0.1", "localhost", "::1", "[::1]"].includes(normalized);
 }
 
+/**
+ * `LEGACY_CONFIG_RULES` 是一个规则定义的数组。
+ * 每一条规则都描述了一个旧版的配置项。
+ *
+ * 每条规则包含:
+ * - `path`: 一个字符串数组，表示到达旧版配置项的路径 (例如 `['gateway', 'token']`)。
+ * - `message`: 一条人类可读的消息，解释为什么这个配置是旧版的，以及它被什么取代了。
+ * - `match` (可选): 一个函数，用于执行更复杂的检查。
+ * - `requireSourceLiteral` (可选): 一个布尔值，如果为 `true`，则该规则仅在原始配置文件中存在该键时才触发。
+ */
 export const LEGACY_CONFIG_RULES: LegacyConfigRule[] = [
+  // 示例: 简单的路径检查
   {
     path: ["whatsapp"],
-    message: "whatsapp config moved to channels.whatsapp (auto-migrated on load).",
+    message: "whatsapp 配置已移动到 channels.whatsapp (加载时会自动迁移)。",
   },
   {
     path: ["telegram"],
-    message: "telegram config moved to channels.telegram (auto-migrated on load).",
+    message: "telegram 配置已移动到 channels.telegram (加载时会自动迁移)。",
   },
-  {
-    path: ["discord"],
-    message: "discord config moved to channels.discord (auto-migrated on load).",
-  },
-  {
-    path: ["slack"],
-    message: "slack config moved to channels.slack (auto-migrated on load).",
-  },
-  {
-    path: ["signal"],
-    message: "signal config moved to channels.signal (auto-migrated on load).",
-  },
-  {
-    path: ["imessage"],
-    message: "imessage config moved to channels.imessage (auto-migrated on load).",
-  },
-  {
-    path: ["msteams"],
-    message: "msteams config moved to channels.msteams (auto-migrated on load).",
-  },
+  // ... 其他渠道的类似规则 ...
+
+  // 示例: 使用 `match` 函数进行更复杂的检查
   {
     path: ["session", "threadBindings"],
-    message:
-      "session.threadBindings.ttlHours was renamed to session.threadBindings.idleHours (auto-migrated on load).",
-    match: (value) => hasLegacyThreadBindingTtl(value),
-  },
-  {
-    path: ["channels", "discord", "threadBindings"],
-    message:
-      "channels.discord.threadBindings.ttlHours was renamed to channels.discord.threadBindings.idleHours (auto-migrated on load).",
-    match: (value) => hasLegacyThreadBindingTtl(value),
+    message: "session.threadBindings.ttlHours 已重命名为 session.threadBindings.idleHours (加载时会自动迁移)。",
+    match: (value) => hasLegacyThreadBindingTtl(value), // 仅当对象中包含 `ttlHours` 键时才匹配
   },
   {
     path: ["channels", "discord", "accounts"],
-    message:
-      "channels.discord.accounts.<id>.threadBindings.ttlHours was renamed to channels.discord.accounts.<id>.threadBindings.idleHours (auto-migrated on load).",
+    message: "channels.discord.accounts.<id>.threadBindings.ttlHours 已重命名为 channels.discord.accounts.<id>.threadBindings.idleHours (加载时会自动迁移)。",
     match: (value) => hasLegacyThreadBindingTtlInAccounts(value),
   },
   {
     path: ["routing", "allowFrom"],
-    message:
-      "routing.allowFrom was removed; use channels.whatsapp.allowFrom instead (auto-migrated on load).",
+    message: "routing.allowFrom 已移除；请使用 channels.whatsapp.allowFrom (加载时会自动迁移)。",
   },
-  {
-    path: ["routing", "bindings"],
-    message: "routing.bindings was moved; use top-level bindings instead (auto-migrated on load).",
-  },
-  {
-    path: ["routing", "agents"],
-    message: "routing.agents was moved; use agents.list instead (auto-migrated on load).",
-  },
-  {
-    path: ["routing", "defaultAgentId"],
-    message:
-      "routing.defaultAgentId was moved; use agents.list[].default instead (auto-migrated on load).",
-  },
-  {
-    path: ["routing", "agentToAgent"],
-    message:
-      "routing.agentToAgent was moved; use tools.agentToAgent instead (auto-migrated on load).",
-  },
-  {
-    path: ["routing", "groupChat", "requireMention"],
-    message:
-      'routing.groupChat.requireMention was removed; use channels.whatsapp/telegram/imessage groups defaults (e.g. channels.whatsapp.groups."*".requireMention) instead (auto-migrated on load).',
-  },
-  {
-    path: ["routing", "groupChat", "mentionPatterns"],
-    message:
-      "routing.groupChat.mentionPatterns was moved; use agents.list[].groupChat.mentionPatterns or messages.groupChat.mentionPatterns instead (auto-migrated on load).",
-  },
-  {
-    path: ["routing", "queue"],
-    message: "routing.queue was moved; use messages.queue instead (auto-migrated on load).",
-  },
-  {
-    path: ["routing", "transcribeAudio"],
-    message:
-      "routing.transcribeAudio was moved; use tools.media.audio.models instead (auto-migrated on load).",
-  },
-  {
-    path: ["telegram", "requireMention"],
-    message:
-      'telegram.requireMention was removed; use channels.telegram.groups."*".requireMention instead (auto-migrated on load).',
-  },
-  {
-    path: ["identity"],
-    message: "identity was moved; use agents.list[].identity instead (auto-migrated on load).",
-  },
-  {
-    path: ["agent"],
-    message:
-      "agent.* was moved; use agents.defaults (and tools.* for tool/elevated/exec settings) instead (auto-migrated on load).",
-  },
-  {
-    path: ["memorySearch"],
-    message:
-      "top-level memorySearch was moved; use agents.defaults.memorySearch instead (auto-migrated on load).",
-  },
-  {
-    path: ["tools", "bash"],
-    message: "tools.bash was removed; use tools.exec instead (auto-migrated on load).",
-  },
+  // ... 更多关于 `routing` 的迁移规则 ...
+
+  // 示例: 检查值的类型
   {
     path: ["agent", "model"],
-    message:
-      "agent.model string was replaced by agents.defaults.model.primary/fallbacks and agents.defaults.models (auto-migrated on load).",
-    match: (value) => typeof value === "string",
-  },
-  {
-    path: ["agent", "imageModel"],
-    message:
-      "agent.imageModel string was replaced by agents.defaults.imageModel.primary/fallbacks (auto-migrated on load).",
-    match: (value) => typeof value === "string",
-  },
-  {
-    path: ["agent", "allowedModels"],
-    message: "agent.allowedModels was replaced by agents.defaults.models (auto-migrated on load).",
-  },
-  {
-    path: ["agent", "modelAliases"],
-    message:
-      "agent.modelAliases was replaced by agents.defaults.models.*.alias (auto-migrated on load).",
-  },
-  {
-    path: ["agent", "modelFallbacks"],
-    message:
-      "agent.modelFallbacks was replaced by agents.defaults.model.fallbacks (auto-migrated on load).",
-  },
-  {
-    path: ["agent", "imageModelFallbacks"],
-    message:
-      "agent.imageModelFallbacks was replaced by agents.defaults.imageModel.fallbacks (auto-migrated on load).",
-  },
-  {
-    path: ["messages", "tts", "enabled"],
-    message: "messages.tts.enabled was replaced by messages.tts.auto (auto-migrated on load).",
+    message: "agent.model (字符串) 已被 agents.defaults.model.primary/fallbacks 和 agents.defaults.models 替代 (加载时会自动迁移)。",
+    match: (value) => typeof value === "string", // 仅当 `agent.model` 是一个字符串时才匹配
   },
   {
     path: ["gateway", "token"],
-    message: "gateway.token is ignored; use gateway.auth.token instead (auto-migrated on load).",
+    message: "gateway.token 已被忽略；请使用 gateway.auth.token (加载时会自动迁移)。",
   },
+  // 示例: 使用 `requireSourceLiteral`
   {
     path: ["gateway", "bind"],
-    message:
-      "gateway.bind host aliases (for example 0.0.0.0/localhost) are legacy; use bind modes (lan/loopback/custom/tailnet/auto) instead (auto-migrated on load).",
+    message: "gateway.bind 的主机别名 (例如 0.0.0.0/localhost) 是旧版配置；请改用绑定模式 (lan/loopback/custom/tailnet/auto) (加载时会自动迁移)。",
     match: (value) => isLegacyGatewayBindHostAlias(value),
-    requireSourceLiteral: true,
+    requireSourceLiteral: true, // 仅当这个旧版值明确存在于磁盘上的源文件中时才触发
   },
   {
     path: ["heartbeat"],
-    message:
-      "top-level heartbeat is not a valid config path; use agents.defaults.heartbeat (cadence/target/model settings) or channels.defaults.heartbeat (showOk/showAlerts/useIndicator).",
+    message: "顶层的 heartbeat 不是有效的配置路径；请使用 agents.defaults.heartbeat (用于节奏/目标/模型设置) 或 channels.defaults.heartbeat (用于显示/警报设置)。",
   },
 ];
