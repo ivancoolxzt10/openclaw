@@ -40,6 +40,18 @@ describe("compaction hook wiring", () => {
     vi.mocked(emitAgentEvent).mockClear();
   });
 
+  /**
+   * Creates a context object for the end of compaction operation
+   * This is typically used in testing to simulate the context passed to compaction end handlers
+   *
+   * @param params - The parameters for creating the context
+   * @param params.runId - Unique identifier for the run
+   * @param params.messages - Optional array of messages to include in the session (defaults to empty array)
+   * @param params.compactionCount - Optional compaction count (defaults to 0)
+   * @param params.withRetryHooks - Optional flag to determine whether to include retry hooks (defaults to false)
+   * @returns An object containing the context properties including params, state, logging functions,
+   *          and methods for handling compaction operations
+   */
   function createCompactionEndCtx(params: {
     runId: string;
     messages?: unknown[];

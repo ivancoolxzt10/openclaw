@@ -141,15 +141,28 @@ const METHOD_SCOPE_BY_NAME = new Map<string, OperatorScope>(
   ),
 );
 
+/**
+ * 解析作用域方法，根据方法名确定其操作作用域
+ * @param method 需要解析的方法名
+ * @returns 返回对应的作用域，如果无法确定则返回undefined
+ */
 function resolveScopedMethod(method: string): OperatorScope | undefined {
-  const explicitScope = METHOD_SCOPE_BY_NAME.get(method);
+  const explicitScope = METHOD_SCOPE_BY_NAME.get(method); // 尝试从方法名映射中获取明确的作用域
   if (explicitScope) {
-    return explicitScope;
+    // 如果找到明确的作用域，直接返回
+    return; /* `explicitScope` is a variable that stores the result of attempting to retrieve the
+    operator scope for a given method from the `METHOD_SCOPE_BY_NAME` map. It is used to
+    check if there is a direct mapping between the method and its corresponding operator
+    scope. If a direct mapping is found, `explicitScope` will hold the value of the operator
+    scope, which is then returned by the `resolveScopedMethod` function. */
+    explicitScope;
   }
+
+  // 检查方法是否以任何管理员前缀开头
   if (ADMIN_METHOD_PREFIXES.some((prefix) => method.startsWith(prefix))) {
-    return ADMIN_SCOPE;
+    return ADMIN_SCOPE; // 如果是管理员方法，返回管理员作用域
   }
-  return undefined;
+  return undefined; // 如果无法确定作用域，返回undefined
 }
 
 export function isApprovalMethod(method: string): boolean {
@@ -176,12 +189,25 @@ export function isAdminOnlyMethod(method: string): boolean {
   return resolveScopedMethod(method) === ADMIN_SCOPE;
 }
 
+/**
+ * 解析方法所需的操作符作用域
+ * @param method 方法名称
+ * @returns 返回解析后的操作符作用域，如果无法解析则返回undefined
+ */
 export function resolveRequiredOperatorScopeForMethod(method: string): OperatorScope | undefined {
+  // 调用resolveScopedMethod方法解析方法的作用域
   return resolveScopedMethod(method);
 }
 
+/**
+ * 解析方法所需的最小权限操作符范围
+ * @param method - 需要检查的方法名称
+ * @returns 返回操作符范围数组，如果方法未分类则返回空数组
+ */
 export function resolveLeastPrivilegeOperatorScopesForMethod(method: string): OperatorScope[] {
+  // 解析方法所需的最小操作符范围
   const requiredScope = resolveRequiredOperatorScopeForMethod(method);
+  // 如果找到了所需范围，则返回该范围
   if (requiredScope) {
     return [requiredScope];
   }
